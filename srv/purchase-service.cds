@@ -1,92 +1,16 @@
-annotate service.PurchaseRequest with @(UI:
- { HeaderInfo : { 
-    TypeName : 'Purchase Request',
-    TypeNamePlural : 'Purchase Requests',
-    Title : { Value : purchaseRequestNo }, 
-    Description : { Value : requesterName }
- },
- LineItem : [ {
-     Value : purchaseRequestNo,
-      Label : 'purchaseRequestNo' }, 
-      { Value : requesterName }, 
-      { Value : department }, 
-      { Value : requestDate },
-       { Value : currency },
-        { Value : totalAmount },
-         { Value : status } ],
+using { purchase.request as my } from '../db/schema';
 
-Facets : [
-     { $Type : 'UI.ReferenceFacet', 
-     Label : 'General Information', 
-     Target : '@UI.FieldGroup#General' }, 
-     { $Type : 'UI.ReferenceFacet',
-     Label : 'Purchase Items',
-     Target : 'items/@UI.LineItem' } ],
+service PurchaseService {
+    @odata.draft.enabled
+    entity PurchaseRequest as projection on my.PurchaseRequest actions {
+        action submitRequest()  returns PurchaseRequest;
+        action approveRequest() returns PurchaseRequest;
+        action rejectRequest()  returns PurchaseRequest;
+        action cancelRequest()  returns PurchaseRequest;
+    };
 
-     FieldGroup #General : {
-         Data : [ { 
-            Value : purchaseRequestNo,
-             Label : 'Purchase Request Number' },
-              { Value : requesterName,
-               Label : 'Requester Name' },
+    entity PurchaseRequestItems as projection on my.PurchaseRequestItems;
+    entity Notifications        as projection on my.Notifications;
 
-    { Value : department,
-     Label : 'Department' },
-     
-   { Value : requestDate, 
-   Label : 'Request Date' },
-   { Value : currency, 
-   Label : 'Currency' },
-   { Value : totalAmount,
-    Label : 'Total Amount' }, 
-   { Value : status,
-     Label : 'Status' } 
-     ] 
-     } 
-     });
-   annotate service.PurchaseRequestItems with @(UI:
-    { LineItem : [
-       { Value : materialNumber },
-        { Value : description }, 
-        { Value : quantity }, 
-        { Value : unitPrice }, 
-        { Value : totalPrice } 
-        ],
-
-        Facets : [ 
-         { 
-            $Type : 'UI.ReferenceFacet', 
-            Label : 'Item Details',
-            Target : '@UI.FieldGroup#General' } 
-            ],
-      FieldGroup #General :
-       { Data : [
-          {
-             Value : purchaseRequestNo,
-             Label : 'Purchase Request Number' }, 
-             { 
-               Value : requesterName,
-               Label : 'Requester Name' },
-               { Value : department, 
-               Label : 'Department' }, 
-               { Value : requestDate, 
-               Label : 'Request Date' },
-                { Value : currency,
-                 Label : 'Currency' },
-
-                 { Value : totalAmount,
-                  Label : 'Total Amount' },
-                  
-                  
-                   { Value : status, 
-                   Label : 'Status' } 
-                   ] 
-                   } 
-                   });
-
-
-
-
-
-
-   
+    action expireOldDrafts() returns String;
+}
