@@ -1,348 +1,1419 @@
 const cds = require('@sap/cds');
 
 module.exports = cds.service.impl(async function () {
-    const { PurchaseRequest, PurchaseRequestItems, Notifications } = this.entities;
 
-    // ------------------------------------------------------------------------
-    // Rule 28: Draft Expiry Implementation
-    // ------------------------------------------------------------------------
-    async function expireOldDrafts() {
-        try {
-            const thirtyDaysAgo = new Date();
-            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-            const cutoffIsoDate = thirtyDaysAgo.toISOString();
+    // ============================================================
+    // Service Entities
+    // ============================================================
 
-            // Find Drafts created or updated more than 30 days ago
-            const expiredDrafts = await SELECT.from(PurchaseRequest).where({
-                status: 'Draft',
-                createdAt: { '<=': cutoffIsoDate }
-            });
+    const {
+        PurchaseRequest,
+        PurchaseRequestItems,
+        Notifications,
+        AuditLogs
+    } = this.entities;
 
-            if (expiredDrafts.length > 0) {
-                const draftIds = expiredDrafts.map(d => d.ID);
 
-                // Update status to 'Expired'
-                await UPDATE(PurchaseRequest)
-                    .set({ status: 'Expired' })
-                    .where({ ID: { in: draftIds } });
+    // ============================================================
+    // AUDIT LOG FUNCTION
+    // ============================================================
+    // This function creates ONE audit record for an actual
+    // business action.
+    //
+    // CREATE
+    // SUBMIT
+    // APPROVE
+    // REJECT
+    // CANCEL
+    //
+    // IMPORTANT:
+    // We DO NOT create audit logs from a generic UPDATE handler.
+    // This prevents Fiori draft operations from creating duplicate
+    // audit records.
+    // ============================================================
 
-                // Create notifications for expired drafts
-                for (const draft of expiredDrafts) {
-                    await createNotification(
-                        null,
-                        draft.ID,
-                        draft.requesterName,
-                        `Purchase Request ${draft.purchaseRequestNo || draft.ID} has expired after 30 days of inactivity.`
+    async function createAuditLog({
+        purchaseRequestID,
+        oldStatus,
+        newStatus,
+        action,
+        user
+    }) {
+
+        await INSERT.into(AuditLogs).entries({
+
+            purchaseRequest_ID: purchaseRequestID,
+
+            oldStatus: oldStatus || 'New',
+
+            newStatus: newStatus || '',
+
+            user: user || 'System',
+
+            timestamp: new Date(),
+
+            action: action
+
+        });
+    }
+
+
+    // ============================================================
+    // RULE 17 - APPROVAL MATRIX
+    // ============================================================
+    //
+    // 0 - 10,000       -> Manager
+    // 10,001 - 50,000  -> Senior Manager
+    // Above 50,000     -> Director
+    //
+    // Approver is automatically determined.
+    // ============================================================
+
+    function determineApprover(totalAmount) {
+
+        const amount = Number(totalAmount || 0);
+
+        if (amount <= 10000) {
+            return 'Manager';
+        }
+
+        if (amount <= 50000) {
+            return 'Senior Manager';
+        }
+
+        return 'Director';
+    }
+
+
+    // ============================================================
+    // RULE 9 - PURCHASE REQUEST NUMBER GENERATION
+    // ============================================================
+    //
+    // Format:
+    // PR-2026-000001
+    //
+    // User should not enter the number manually.
+    // ============================================================
+
+    this.before('CREATE', PurchaseRequest, async (req) => {
+
+        const year = new Date().getFullYear();
+
+        let nextNumber = 1;
+
+        const lastRequest = await SELECT.one
+            .from(PurchaseRequest)
+            .columns('purchaseRequestNo')
+            .where({
+                purchaseRequestNo: {
+                    like: `PR-${year}-%`
+                }
+            })
+            .orderBy('purchaseRequestNo desc');
+
+        if (
+            lastRequest &&
+            lastRequest.purchaseRequestNo
+        ) {
+
+            const parts =
+                lastRequest.purchaseRequestNo.split('-');
+
+            if (parts.length === 3) {
+
+                const lastNumber =
+                    Number(parts[2]);
+
+                if (!isNaN(lastNumber)) {
+                    nextNumber = lastNumber + 1;
+                }
+            }
+        }
+
+        // Automatically generate PR number
+        req.data.purchaseRequestNo =
+            `PR-${year}-${String(nextNumber).padStart(6, '0')}`;
+
+        // Default status
+        req.data.status = 'Draft';
+
+
+        // ========================================================
+        // AUDIT - CREATE
+        // ========================================================
+
+        await createAuditLog({
+            purchaseRequestID: req.data.ID,
+            oldStatus: 'New',
+            newStatus: 'Draft',
+            action: 'CREATE',
+            user: req.user?.id || 'anonymous'
+        });
+    });
+
+
+    // ============================================================
+    // RULE 12 - DEPARTMENT VALIDATION
+    // RULE 22 - REQUEST DATE VALIDATION
+    // RULE 10 - MAXIMUM 20 ITEMS
+    // RULE 2 / 14 - QUANTITY VALIDATION
+    // RULE 7 - DUPLICATE MATERIAL NUMBER
+    // RULE 13 - DESCRIPTION VALIDATION
+    // RULE 15 - UNIT PRICE VALIDATION
+    // RULE 16 - TAX / TOTAL CALCULATION
+    // RULE 23 - MINIMUM AMOUNT
+    // RULE 17 - APPROVER CALCULATION
+    // ============================================================
+
+    this.before(
+        ['CREATE', 'UPDATE'],
+        PurchaseRequest,
+        async (req) => {
+
+            // ----------------------------------------------------
+            // Only Draft requests can be edited
+            // ----------------------------------------------------
+
+            if (req.event === 'UPDATE') {
+
+                const existingRequest =
+                    await SELECT.one
+                        .from(PurchaseRequest)
+                        .columns('status')
+                        .where({
+                            ID: req.data.ID
+                        });
+
+                if (
+                    existingRequest &&
+                    existingRequest.status !== 'Draft'
+                ) {
+
+                    req.error(
+                        400,
+                        'Only Purchase Requests in Draft status can be edited.'
                     );
                 }
-                console.log(`[Rule 28] Successfully expired ${expiredDrafts.length} draft purchase request(s).`);
-            }
-        } catch (err) {
-            console.error('[Rule 28 Error] Failed to process draft expiry:', err.message);
-        }
-    }
-
-    // Run Expiry Check on Service Startup & Schedule Daily Check (24h)
-    cds.on('served', () => {
-        expireOldDrafts();
-        setInterval(expireOldDrafts, 24 * 60 * 60 * 1000);
-    });
-
-    // Explicit Action Endpoint (Optional: Can be invoked manually or via SAP Job Scheduler)
-    this.on('expireOldDrafts', async () => {
-        await expireOldDrafts();
-        return 'Draft expiry check completed.';
-    });
-
-    // Helper: Create Notification
-    async function createNotification(req, purchaseRequestId, recipient, message) {
-        try {
-            await INSERT.into(Notifications).entries({
-                purchaseRequest_ID: purchaseRequestId,
-                recipient: recipient || req?.user?.id || 'System User',
-                message: message,
-                status: 'Unread',
-                createdDate: new Date().toISOString()
-            });
-        } catch (err) {
-            console.error('[Notification Error]:', err.message);
-        }
-    }
-
-    // Auto-generate Purchase Request Number on Initial Creation
-    this.before('CREATE', PurchaseRequest, async (req) => {
-        if (!req.data.purchaseRequestNo) {
-            const year = new Date().getFullYear();
-            let nextNumber = 1;
-
-            const lastRequest = await SELECT.one
-                .from(PurchaseRequest)
-                .columns('purchaseRequestNo')
-                .where({ purchaseRequestNo: { like: `PR-${year}-%` } })
-                .orderBy('purchaseRequestNo desc');
-
-            if (lastRequest?.purchaseRequestNo) {
-                const parts = lastRequest.purchaseRequestNo.split('-');
-                if (parts.length === 3) nextNumber = Number(parts[2]) + 1;
-            }
-            req.data.purchaseRequestNo = `PR-${year}-${String(nextNumber).padStart(6, '0')}`;
-        }
-
-        if (!req.data.status) {
-            req.data.status = 'Draft';
-        }
-    });
-
-    // Guard: Prevent modifications on closed / expired requests
-    this.before('UPDATE', PurchaseRequest, async (req) => {
-        if (req.target?.isDraft) return;
-
-        const ID = req.data?.ID || req.params?.[0]?.ID;
-        if (!ID) return;
-
-        const request = await SELECT.one.from(PurchaseRequest).columns('status').where({ ID });
-        if (request && ['Approved', 'Rejected', 'Cancelled', 'Expired'].includes(request.status)) {
-            req.error(400, `Purchase Request is ${request.status}. It cannot be updated.`);
-        }
-    });
-
-    // Guard: Prevent deletion on submitted, closed, or expired requests
-    this.before('DELETE', PurchaseRequest, async (req) => {
-        const ID = req.data?.ID || req.params?.[0]?.ID;
-        if (!ID) return;
-
-        const request = await SELECT.one.from(PurchaseRequest).columns('status').where({ ID });
-        if (request && ['Submitted', 'Approved', 'Rejected', 'Cancelled', 'Expired'].includes(request.status)) {
-            req.error(400, `Purchase Request in status '${request.status}' cannot be deleted.`);
-        }
-    });
-
-    // Rule 30 Guard: Direct item-level status changes are prohibited
-    this.before(['UPDATE', 'PATCH'], PurchaseRequestItems, async (req) => {
-        if ('status' in req.data) {
-            req.error(400, 'Rule 30: Item-level approval is not allowed. Process the entire request from the header level.');
-        }
-    });
-
-    // Field-level validations and amount calculations
-    this.before(['CREATE', 'UPDATE'], PurchaseRequest, async (req) => {
-        // 1. Department Validation
-        const validDepartments = ['Finance', 'HR', 'Procurement', 'Manufacturing', 'IT'];
-        if (req.data.department && !validDepartments.includes(req.data.department)) {
-            req.error(400, `Invalid Department. Valid departments: ${validDepartments.join(', ')}`);
-        }
-
-        // 2. Request Date Validation
-        if (req.data.requestDate) {
-            const requestDate = new Date(req.data.requestDate);
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-            requestDate.setHours(0, 0, 0, 0);
-
-            if (requestDate > today) {
-                req.error(400, 'Request Date cannot be in the future.');
             }
 
-            const thirtyDaysAgo = new Date(today);
-            thirtyDaysAgo.setDate(today.getDate() - 30);
-            if (requestDate < thirtyDaysAgo) {
-                req.error(400, 'Request Date cannot be more than 30 days old.');
+
+            // ----------------------------------------------------
+            // Rule 12 - Department Validation
+            // ----------------------------------------------------
+
+            const validDepartments = [
+                'Finance',
+                'HR',
+                'Procurement',
+                'Manufacturing',
+                'IT'
+            ];
+
+            if (
+                req.data.department &&
+                !validDepartments.includes(
+                    req.data.department
+                )
+            ) {
+
+                req.error(
+                    400,
+                    `Invalid Department. Valid Departments are: ${validDepartments.join(', ')}`
+                );
             }
-        }
 
-        // 3. Item Calculations
-        if (req.data.items && Array.isArray(req.data.items)) {
-            if (req.data.items.length > 20) {
-                req.error(400, 'A Purchase Request cannot contain more than 20 items.');
+
+            // ----------------------------------------------------
+            // Rule 22 - Request Date Validation
+            // ----------------------------------------------------
+
+            if (req.data.requestDate) {
+
+                const requestDate =
+                    new Date(req.data.requestDate);
+
+                const today = new Date();
+
+                today.setHours(0, 0, 0, 0);
+                requestDate.setHours(0, 0, 0, 0);
+
+
+                if (requestDate > today) {
+
+                    req.error(
+                        400,
+                        'Request Date cannot be a future date.'
+                    );
+                }
+
+
+                const thirtyDaysAgo =
+                    new Date(today);
+
+                thirtyDaysAgo.setDate(
+                    today.getDate() - 30
+                );
+
+
+                if (requestDate < thirtyDaysAgo) {
+
+                    req.error(
+                        400,
+                        'Request Date cannot be more than 30 days old.'
+                    );
+                }
             }
 
-            const materialNumbers = new Set();
-            let totalAmount = 0;
 
-            for (const item of req.data.items) {
-                if (item.materialNumber) {
-                    if (materialNumbers.has(item.materialNumber)) {
-                        req.error(400, `Duplicate Material Number '${item.materialNumber}' within the same request.`);
+            // ----------------------------------------------------
+            // Rule 10 - Maximum 20 Items
+            // ----------------------------------------------------
+
+            if (
+                req.data.items &&
+                req.data.items.length > 20
+            ) {
+
+                req.error(
+                    400,
+                    'A Purchase Request cannot contain more than 20 items.'
+                );
+            }
+
+
+            // ----------------------------------------------------
+            // Item validations
+            // ----------------------------------------------------
+
+            if (
+                req.data.items &&
+                req.data.items.length > 0
+            ) {
+
+                let totalAmount = 0;
+
+                const materialNumbers = new Set();
+
+
+                for (const item of req.data.items) {
+
+                    // ============================================
+                    // Rule 2 - Quantity > 0
+                    // Rule 14 - Quantity <= 100
+                    // ============================================
+
+                    if (
+                        item.quantity !== undefined &&
+                        item.quantity !== null
+                    ) {
+
+                        if (item.quantity <= 0) {
+
+                            req.error(
+                                400,
+                                'Quantity should always be greater than zero.'
+                            );
+                        }
+
+
+                        if (item.quantity > 100) {
+
+                            req.error(
+                                400,
+                                'Quantity cannot exceed 100.'
+                            );
+                        }
                     }
-                    materialNumbers.add(item.materialNumber);
+
+
+                    // ============================================
+                    // Rule 7 - Duplicate Material Numbers
+                    // ============================================
+
+                    if (item.materialNumber) {
+
+                        if (
+                            materialNumbers.has(
+                                item.materialNumber
+                            )
+                        ) {
+
+                            req.error(
+                                400,
+                                `Duplicate Material Number '${item.materialNumber}' is not allowed within the same Purchase Request.`
+                            );
+                        }
+
+                        materialNumbers.add(
+                            item.materialNumber
+                        );
+                    }
+
+
+                    // ============================================
+                    // Rule 13 - Description Validation
+                    // ============================================
+
+                    if (
+                        item.description === undefined ||
+                        item.description === null ||
+                        item.description.trim() === ''
+                    ) {
+
+                        req.error(
+                            400,
+                            'Material Description cannot be empty.'
+                        );
+                    }
+
+
+                    if (
+                        item.description &&
+                        item.description.trim().length < 10
+                    ) {
+
+                        req.error(
+                            400,
+                            'Material Description should contain at least 10 characters.'
+                        );
+                    }
+
+
+                    // ============================================
+                    // Rule 15 - Unit Price Validation
+                    // ============================================
+
+                    if (
+                        item.unitPrice !== undefined &&
+                        item.unitPrice !== null
+                    ) {
+
+                        if (item.unitPrice <= 0) {
+
+                            req.error(
+                                400,
+                                'Unit Price should be greater than 0.'
+                            );
+                        }
+
+
+                        if (item.unitPrice >= 100000) {
+
+                            req.error(
+                                400,
+                                'Unit Price should be less than 1,00,000.'
+                            );
+                        }
+                    }
+
+
+                    // ============================================
+                    // Rule 16 - Automatic Tax Calculation
+                    // ============================================
+
+                    if (
+                        item.quantity !== undefined &&
+                        item.quantity !== null &&
+                        item.unitPrice !== undefined &&
+                        item.unitPrice !== null
+                    ) {
+
+                        item.netAmount =
+                            Number(item.quantity) *
+                            Number(item.unitPrice);
+
+
+                        // 18% tax
+                        item.tax =
+                            Number(item.netAmount) * 0.18;
+
+
+                        // Gross amount
+                        item.grossAmount =
+                            Number(item.netAmount) +
+                            Number(item.tax);
+
+
+                        // Total price
+                        item.totalPrice =
+                            item.grossAmount;
+
+
+                        totalAmount +=
+                            Number(item.grossAmount);
+                    }
                 }
 
-                if (item.quantity !== undefined && item.quantity !== null) {
-                    if (item.quantity <= 0) req.error(400, 'Quantity must be greater than 0.');
-                    if (item.quantity > 100) req.error(400, 'Quantity cannot exceed 100.');
+
+                // ================================================
+                // Rule 5 - Total Amount
+                // ================================================
+
+                req.data.totalAmount =
+                    totalAmount;
+
+
+                // ================================================
+                // Rule 23 - Minimum Amount
+                // ================================================
+
+                if (totalAmount <= 100) {
+
+                    req.error(
+                        400,
+                        'Purchase Request Total Amount should be greater than ₹100.'
+                    );
                 }
 
-                if (item.unitPrice !== undefined && item.unitPrice !== null) {
-                    if (item.unitPrice <= 0) req.error(400, 'Unit Price must be greater than 0.');
-                    if (item.unitPrice >= 100000) req.error(400, 'Unit Price must be less than 1,00,000.');
-                }
 
-                if (item.quantity && item.unitPrice) {
-                    item.netAmount = item.quantity * item.unitPrice;
-                    item.tax = item.netAmount * 0.18;
-                    item.grossAmount = item.netAmount + item.tax;
-                    item.totalPrice = item.grossAmount;
-                    totalAmount += Number(item.grossAmount);
-                }
-            }
+                // ================================================
+                // Rule 17 - Automatically Determine Approver
+                // ================================================
 
-            req.data.totalAmount = totalAmount;
-        }
-    });
-
-    // ------------------------------------------------------------------------
-    // Custom Bound Actions
-    // ------------------------------------------------------------------------
-
-    // Submit Request Action
-    this.on('submitRequest', async (req) => {
-        const targetQuery = req.subject;
-        const request = await SELECT.one.from(targetQuery);
-
-        if (!request) {
-            return req.error(404, 'Purchase Request not found.');
-        }
-
-        const currentStatus = (request.status || 'DRAFT').toUpperCase();
-        if (currentStatus === 'EXPIRED') {
-            return req.error(400, 'This Purchase Request has expired and cannot be submitted.');
-        }
-        if (currentStatus !== 'DRAFT') {
-            return req.error(400, `Only Draft Purchase Requests can be submitted. Current status: ${request.status}`);
-        }
-
-        // --------------------------------------------------------------------
-        // Rule 1: Must contain at least one line item before submitting
-        // --------------------------------------------------------------------
-        const items = await SELECT.from(PurchaseRequestItems).where({ parent_ID: request.ID });
-        if (!items || items.length === 0) {
-            return req.error(400, 'Rule 1: At least one item must exist before submitting a Purchase Request.');
-        }
-
-        if ((request.totalAmount || 0) <= 100) {
-            return req.error(400, 'Purchase Request Total Amount must be greater than ₹100 before submitting.');
-        }
-
-        // Set status to Submitted
-        await UPDATE(targetQuery).set({ status: 'Submitted' });
-
-        await createNotification(
-            req,
-            request.ID,
-            request.requesterName,
-            `Purchase Request ${request.purchaseRequestNo || request.ID} has been submitted successfully.`
-        );
-
-        req.notify(`Purchase Request ${request.purchaseRequestNo || ''} submitted successfully.`);
-        return SELECT.one.from(targetQuery);
-    });
-
-    // Approve Action (Rule 30: All-or-Nothing Item Validation)
-    this.on('approveRequest', async (req) => {
-        const targetQuery = req.subject;
-        const request = await SELECT.one.from(targetQuery);
-
-        if (!request) return req.error(404, 'Purchase Request not found.');
-        if (request.status !== 'Submitted') {
-            return req.error(400, 'Only Submitted Purchase Requests can be approved.');
-        }
-
-        // Fetch associated line items
-        const items = await SELECT.from(PurchaseRequestItems).where({ parent_ID: request.ID });
-
-        if (!items || items.length === 0) {
-            return req.error(400, 'Cannot approve a Purchase Request with no items.');
-        }
-
-        // Rule 30 Validation: Evaluate all rules across the entire item batch
-        const invalidItems = [];
-        for (const item of items) {
-            if (!item.materialNumber) {
-                invalidItems.push(`Item ID ${item.ID}: Missing Material Number.`);
-            }
-            if (!item.quantity || item.quantity <= 0 || item.quantity > 100) {
-                invalidItems.push(`Item '${item.materialNumber || item.ID}': Invalid quantity (${item.quantity}).`);
-            }
-            if (!item.unitPrice || item.unitPrice <= 0 || item.unitPrice >= 100000) {
-                invalidItems.push(`Item '${item.materialNumber || item.ID}': Invalid unit price (${item.unitPrice}).`);
+                req.data.approver =
+                    determineApprover(totalAmount);
             }
         }
+    );
 
-        // Rule 30 Enforcement: If ANY item fails, reject the ENTIRE request batch
-        if (invalidItems.length > 0) {
-            await UPDATE(targetQuery).set({ status: 'Rejected' });
-            await UPDATE(PurchaseRequestItems).where({ parent_ID: request.ID }).set({ status: 'Rejected' });
 
-            await createNotification(
-                req,
-                request.ID,
-                request.requesterName,
-                `Purchase Request ${request.purchaseRequestNo || request.ID} was rejected due to line-item rule failures.`
+    // ============================================================
+    // RULE 11 - DUPLICATE PURCHASE REQUEST
+    // ============================================================
+
+    this.before(
+        ['CREATE', 'UPDATE'],
+        PurchaseRequest,
+        async (req) => {
+
+            if (
+                !req.data.requesterName ||
+                !req.data.department ||
+                !req.data.items ||
+                req.data.items.length === 0
+            ) {
+                return;
+            }
+
+
+            const sevenDaysAgo =
+                new Date();
+
+            sevenDaysAgo.setDate(
+                sevenDaysAgo.getDate() - 7
             );
 
-            return req.error(400, `Rule 30 Applied: One or more line items failed validation. The entire request was REJECTED.\n` + invalidItems.join('\n'));
+
+            const existingRequests =
+                await SELECT
+                    .from(PurchaseRequest)
+                    .columns(
+                        'ID',
+                        'requestDate'
+                    )
+                    .where({
+                        requesterName:
+                            req.data.requesterName,
+
+                        department:
+                            req.data.department
+                    });
+
+
+            for (
+                const existingRequest
+                of existingRequests
+            ) {
+
+                // Ignore same request during UPDATE
+                if (
+                    req.event === 'UPDATE' &&
+                    existingRequest.ID === req.data.ID
+                ) {
+                    continue;
+                }
+
+
+                if (
+                    existingRequest.requestDate &&
+                    new Date(existingRequest.requestDate)
+                        >= sevenDaysAgo
+                ) {
+
+                    const existingItems =
+                        await SELECT
+                            .from(PurchaseRequestItems)
+                            .where({
+                                parent_ID:
+                                    existingRequest.ID
+                            });
+
+
+                    for (
+                        const currentItem
+                        of req.data.items
+                    ) {
+
+                        const duplicate =
+                            existingItems.find(
+                                existingItem =>
+                                    existingItem.materialNumber ===
+                                    currentItem.materialNumber &&
+
+                                    Number(
+                                        existingItem.quantity
+                                    ) ===
+                                    Number(
+                                        currentItem.quantity
+                                    )
+                            );
+
+
+                        if (duplicate) {
+
+                            req.error(
+                                400,
+                                'Duplicate Purchase Request is not allowed. The same requester cannot create another request with the same Material Number, Quantity and Department within the last 7 days.'
+                            );
+                        }
+                    }
+                }
+            }
         }
+    );
 
-        // If ALL items pass validation, approve the ENTIRE batch
-        await UPDATE(targetQuery).set({ status: 'Approved' });
-        await UPDATE(PurchaseRequestItems).where({ parent_ID: request.ID }).set({ status: 'Approved' });
 
-        await createNotification(
-            req,
-            request.ID,
-            request.requesterName,
-            `Purchase Request ${request.purchaseRequestNo || request.ID} has been approved.`
+    // ============================================================
+    // PURCHASE REQUEST UPDATE RESTRICTION
+    // ============================================================
+
+    this.before(
+        'UPDATE',
+        PurchaseRequest,
+        async (req) => {
+
+            const request =
+                await SELECT.one
+                    .from(PurchaseRequest)
+                    .columns(
+                        'status',
+                        'purchaseRequestNo'
+                    )
+                    .where({
+                        ID: req.data.ID
+                    });
+
+
+            if (!request) {
+                return;
+            }
+
+
+            // ----------------------------------------------------
+            // Approved / Rejected / Cancelled cannot be modified
+            // ----------------------------------------------------
+
+            if (
+                [
+                    'Approved',
+                    'Rejected',
+                    'Cancelled'
+                ].includes(request.status)
+            ) {
+
+                req.error(
+                    400,
+                    `Purchase Request is ${request.status}. It is read-only and cannot be updated.`
+                );
+            }
+
+
+            // ----------------------------------------------------
+            // PR Number cannot be manually changed
+            // ----------------------------------------------------
+
+            if (
+                req.data.purchaseRequestNo &&
+                req.data.purchaseRequestNo !==
+                    request.purchaseRequestNo
+            ) {
+
+                req.error(
+                    400,
+                    'Purchase Request Number is automatically generated and cannot be changed.'
+                );
+            }
+        }
+    );
+
+
+    // ============================================================
+    // PURCHASE REQUEST DELETE RESTRICTION
+    // ============================================================
+
+    this.before(
+        'DELETE',
+        PurchaseRequest,
+        async (req) => {
+
+            const request =
+                await SELECT.one
+                    .from(PurchaseRequest)
+                    .columns('status')
+                    .where({
+                        ID: req.data.ID
+                    });
+
+
+            if (
+                request &&
+                [
+                    'Approved',
+                    'Rejected',
+                    'Cancelled'
+                ].includes(request.status)
+            ) {
+
+                req.error(
+                    400,
+                    `Purchase Request is ${request.status}. It cannot be deleted.`
+                );
+            }
+        }
+    );
+
+
+    // ============================================================
+    // RULE 24
+    // ITEM DELETE RESTRICTION
+    // ============================================================
+
+    this.before(
+        'DELETE',
+        PurchaseRequestItems,
+        async (req) => {
+
+            const ID =
+                req.data.ID ||
+                (
+                    req.params[0] &&
+                    req.params[0].ID
+                );
+
+
+            if (!ID) {
+
+                return req.error(
+                    400,
+                    'Purchase Request Item ID is missing.'
+                );
+            }
+
+
+            const item =
+                await SELECT.one
+                    .from(PurchaseRequestItems)
+                    .columns('parent_ID')
+                    .where({
+                        ID
+                    });
+
+
+            if (!item) {
+
+                return req.error(
+                    404,
+                    'Purchase Request Item not found.'
+                );
+            }
+
+
+            const request =
+                await SELECT.one
+                    .from(PurchaseRequest)
+                    .columns('status')
+                    .where({
+                        ID: item.parent_ID
+                    });
+
+
+            if (
+                request &&
+                [
+                    'Submitted',
+                    'Approved',
+                    'Rejected',
+                    'Cancelled'
+                ].includes(request.status)
+            ) {
+
+                req.error(
+                    400,
+                    'Items cannot be deleted after the Purchase Request has been submitted.'
+                );
+            }
+        }
+    );
+
+
+    // ============================================================
+    // RULE 10
+    // MAXIMUM 20 ITEMS
+    // ============================================================
+
+    this.before(
+        'CREATE',
+        PurchaseRequestItems,
+        async (req) => {
+
+            const parentID =
+                req.data.parent_ID;
+
+
+            if (!parentID) {
+                return;
+            }
+
+
+            const items =
+                await SELECT
+                    .from(PurchaseRequestItems)
+                    .where({
+                        parent_ID: parentID
+                    });
+
+
+            const totalItems =
+                items.length + 1;
+
+
+            if (totalItems > 20) {
+
+                req.error(
+                    400,
+                    'A Purchase Request cannot contain more than 20 items.'
+                );
+            }
+        }
+    );
+
+
+    // ============================================================
+    // RULE 1
+    // AT LEAST ONE ITEM BEFORE SUBMISSION
+    // ============================================================
+
+    this.on(
+        'submitRequest',
+        async (req) => {
+
+            const ID =
+                req.params[0].ID;
+
+
+            const request =
+                await SELECT.one
+                    .from(PurchaseRequest)
+                    .where({
+                        ID
+                    });
+
+
+            if (!request) {
+
+                return req.error(
+                    404,
+                    'Purchase Request not found.'
+                );
+            }
+
+
+            // Only Draft can be submitted
+            if (request.status !== 'Draft') {
+
+                return req.error(
+                    400,
+                    'Only Draft Purchase Requests can be submitted.'
+                );
+            }
+
+
+            // Check items
+            const items =
+                await SELECT
+                    .from(PurchaseRequestItems)
+                    .where({
+                        parent_ID: ID
+                    });
+
+
+            if (
+                !items ||
+                items.length === 0
+            ) {
+
+                return req.error(
+                    400,
+                    'At least one item should exist before submitting a Purchase Request.'
+                );
+            }
+
+
+            // ----------------------------------------------------
+            // Draft → Submitted
+            // ----------------------------------------------------
+
+            await UPDATE(PurchaseRequest)
+                .set({
+                    status: 'Submitted'
+                })
+                .where({
+                    ID
+                });
+
+
+            // ----------------------------------------------------
+            // ONLY ONE AUDIT LOG
+            // ----------------------------------------------------
+
+            await createAuditLog({
+
+                purchaseRequestID: ID,
+
+                oldStatus: 'Draft',
+
+                newStatus: 'Submitted',
+
+                action: 'SUBMIT',
+
+                user:
+                    req.user?.id ||
+                    'anonymous'
+            });
+
+
+            return SELECT.one
+                .from(PurchaseRequest)
+                .where({
+                    ID
+                });
+        }
+    );
+
+
+    // ============================================================
+    // APPROVE REQUEST
+    // Submitted → Approved
+    // ============================================================
+
+    this.on(
+        'approveRequest',
+        async (req) => {
+
+            const ID =
+                req.params[0].ID;
+
+
+            const request =
+                await SELECT.one
+                    .from(PurchaseRequest)
+                    .where({
+                        ID
+                    });
+
+
+            if (!request) {
+
+                return req.error(
+                    404,
+                    'Purchase Request not found.'
+                );
+            }
+
+
+            if (request.status === 'Approved') {
+
+                return req.error(
+                    400,
+                    'Purchase Request is already approved.'
+                );
+            }
+
+
+            if (request.status === 'Rejected') {
+
+                return req.error(
+                    400,
+                    'Rejected Purchase Requests cannot be approved.'
+                );
+            }
+
+
+            if (request.status !== 'Submitted') {
+
+                return req.error(
+                    400,
+                    'Only Submitted Purchase Requests can be approved.'
+                );
+            }
+
+
+            // ----------------------------------------------------
+            // Rule 17 - Determine Approver
+            // ----------------------------------------------------
+
+            const approver =
+                determineApprover(
+                    request.totalAmount
+                );
+
+
+            // ----------------------------------------------------
+            // Submitted → Approved
+            // ----------------------------------------------------
+
+            await UPDATE(PurchaseRequest)
+                .set({
+                    status: 'Approved',
+                    approver: approver
+                })
+                .where({
+                    ID
+                });
+
+
+            // ----------------------------------------------------
+            // ONLY ONE AUDIT LOG
+            // ----------------------------------------------------
+
+            await createAuditLog({
+
+                purchaseRequestID: ID,
+
+                oldStatus: 'Submitted',
+
+                newStatus: 'Approved',
+
+                action: 'APPROVE',
+
+                user:
+                    req.user?.id ||
+                    'anonymous'
+            });
+
+
+            return SELECT.one
+                .from(PurchaseRequest)
+                .where({
+                    ID
+                });
+        }
+    );
+
+
+    // ============================================================
+    // REJECT REQUEST
+    // Submitted → Rejected
+    // ============================================================
+    //
+    // Rule 18:
+    // Rejection comments are mandatory.
+    // Minimum 20 characters.
+    // ============================================================
+
+    this.on(
+        'rejectRequest',
+        async (req) => {
+
+            const ID =
+                req.params[0].ID;
+
+
+            const rejectionReason =
+                (
+                    req.data.rejectionReason ||
+                    ''
+                ).trim();
+
+
+            const request =
+                await SELECT.one
+                    .from(PurchaseRequest)
+                    .where({
+                        ID
+                    });
+
+
+            if (!request) {
+
+                return req.error(
+                    404,
+                    'Purchase Request not found.'
+                );
+            }
+
+
+            // Approved cannot be rejected
+            if (request.status === 'Approved') {
+
+                return req.error(
+                    400,
+                    'Approved Purchase Requests cannot be rejected.'
+                );
+            }
+
+
+            if (request.status === 'Rejected') {
+
+                return req.error(
+                    400,
+                    'Purchase Request is already rejected.'
+                );
+            }
+
+
+            if (request.status !== 'Submitted') {
+
+                return req.error(
+                    400,
+                    'Only Submitted Purchase Requests can be rejected.'
+                );
+            }
+
+
+            // ----------------------------------------------------
+            // Rule 18 - Rejection Comment
+            // ----------------------------------------------------
+
+            if (
+                rejectionReason.length < 20
+            ) {
+
+                return req.error(
+                    400,
+                    'Rejection comments are mandatory and must contain at least 20 characters.'
+                );
+            }
+
+
+            // ----------------------------------------------------
+            // Submitted → Rejected
+            // ----------------------------------------------------
+
+            await UPDATE(PurchaseRequest)
+                .set({
+                    status: 'Rejected'
+                })
+                .where({
+                    ID
+                });
+
+
+            // ----------------------------------------------------
+            // ONLY ONE AUDIT LOG
+            // ----------------------------------------------------
+
+            await createAuditLog({
+
+                purchaseRequestID: ID,
+
+                oldStatus: 'Submitted',
+
+                newStatus: 'Rejected',
+
+                action: 'REJECT',
+
+                user:
+                    req.user?.id ||
+                    'anonymous'
+            });
+
+
+            return SELECT.one
+                .from(PurchaseRequest)
+                .where({
+                    ID
+                });
+        }
+    );
+
+
+    // ============================================================
+    // RULE 20 - CANCEL REQUEST
+    // ============================================================
+    //
+    // Draft → Cancelled
+    // Submitted → Cancelled
+    //
+    // Approved cannot be cancelled.
+    // Rejected cannot be cancelled.
+    // ============================================================
+
+    this.on(
+        'cancelRequest',
+        async (req) => {
+
+            const ID =
+                req.params[0].ID;
+
+
+            const request =
+                await SELECT.one
+                    .from(PurchaseRequest)
+                    .where({
+                        ID
+                    });
+
+
+            if (!request) {
+
+                return req.error(
+                    404,
+                    'Purchase Request not found.'
+                );
+            }
+
+
+            if (request.status === 'Cancelled') {
+
+                return req.error(
+                    400,
+                    'Purchase Request is already cancelled.'
+                );
+            }
+
+
+            if (request.status === 'Approved') {
+
+                return req.error(
+                    400,
+                    'Approved Purchase Requests cannot be cancelled.'
+                );
+            }
+
+
+            if (request.status === 'Rejected') {
+
+                return req.error(
+                    400,
+                    'Rejected Purchase Requests cannot be cancelled.'
+                );
+            }
+
+
+            if (
+                request.status !== 'Draft' &&
+                request.status !== 'Submitted'
+            ) {
+
+                return req.error(
+                    400,
+                    'Only Draft or Submitted Purchase Requests can be cancelled.'
+                );
+            }
+
+
+            const oldStatus =
+                request.status;
+
+
+            // ----------------------------------------------------
+            // Draft / Submitted → Cancelled
+            // ----------------------------------------------------
+
+            await UPDATE(PurchaseRequest)
+                .set({
+                    status: 'Cancelled'
+                })
+                .where({
+                    ID
+                });
+
+
+            // ----------------------------------------------------
+            // ONLY ONE AUDIT LOG
+            // ----------------------------------------------------
+
+            await createAuditLog({
+
+                purchaseRequestID: ID,
+
+                oldStatus: oldStatus,
+
+                newStatus: 'Cancelled',
+
+                action: 'CANCEL',
+
+                user:
+                    req.user?.id ||
+                    'anonymous'
+            });
+
+
+            return SELECT.one
+                .from(PurchaseRequest)
+                .where({
+                    ID
+                });
+        }
+    );
+
+
+    // ============================================================
+    // RULE 28 - DRAFT EXPIRY
+    // ============================================================
+    //
+    // Draft requests older than 30 days become Expired.
+    // ============================================================
+
+    async function expireOldDrafts() {
+
+        const cutoff =
+            new Date();
+
+        cutoff.setDate(
+            cutoff.getDate() - 30
         );
 
-        req.notify(`Purchase Request ${request.purchaseRequestNo || ''} approved successfully.`);
-        return SELECT.one.from(targetQuery);
-    });
 
-    // Reject Action (Rule 30: Rejects Header + All Items)
-    this.on('rejectRequest', async (req) => {
-        const targetQuery = req.subject;
-        const request = await SELECT.one.from(targetQuery);
+        const drafts =
+            await SELECT
+                .from(PurchaseRequest)
+                .where({
+                    status: 'Draft'
+                });
 
-        if (!request) return req.error(404, 'Purchase Request not found.');
-        if (request.status !== 'Submitted') {
-            return req.error(400, 'Only Submitted Purchase Requests can be rejected.');
+
+        let expiredCount = 0;
+
+
+        for (const request of drafts) {
+
+            if (
+                request.createdAt &&
+                new Date(request.createdAt) <= cutoff
+            ) {
+
+                await UPDATE(PurchaseRequest)
+                    .set({
+                        status: 'Expired'
+                    })
+                    .where({
+                        ID: request.ID
+                    });
+
+
+                // ------------------------------------------------
+                // Notification
+                // ------------------------------------------------
+
+                await INSERT.into(
+                    Notifications
+                ).entries({
+
+                    purchaseRequest_ID:
+                        request.ID,
+
+                    recipient:
+                        request.requesterName ||
+                        'User',
+
+                    message:
+                        'Purchase Request has expired because it remained in Draft status for more than 30 days.',
+
+                    status:
+                        'Unread',
+
+                    createdDate:
+                        new Date()
+                });
+
+
+                // ------------------------------------------------
+                // Audit log for expiry
+                // ------------------------------------------------
+
+                await createAuditLog({
+
+                    purchaseRequestID:
+                        request.ID,
+
+                    oldStatus:
+                        'Draft',
+
+                    newStatus:
+                        'Expired',
+
+                    action:
+                        'EXPIRE',
+
+                    user:
+                        'System'
+                });
+
+
+                expiredCount++;
+            }
         }
 
-        // Update Header and ALL Line Items to Rejected simultaneously
-        await UPDATE(targetQuery).set({ status: 'Rejected' });
-        await UPDATE(PurchaseRequestItems).where({ parent_ID: request.ID }).set({ status: 'Rejected' });
 
-        await createNotification(
-            req,
-            request.ID,
-            request.requesterName,
-            `Purchase Request ${request.purchaseRequestNo || request.ID} has been rejected.`
-        );
+        return expiredCount;
+    }
 
-        req.notify(`Purchase Request ${request.purchaseRequestNo || ''} rejected.`);
-        return SELECT.one.from(targetQuery);
-    });
 
-    // Cancel Action
-    this.on('cancelRequest', async (req) => {
-        const targetQuery = req.subject;
-        const request = await SELECT.one.from(targetQuery);
+    // ============================================================
+    // EXPOSE EXPIRE OLD DRAFTS ACTION
+    // ============================================================
 
-        if (!request) return req.error(404, 'Purchase Request not found.');
-        if (['Approved', 'Cancelled', 'Expired'].includes(request.status)) {
-            return req.error(400, `Purchase Request in status '${request.status}' cannot be cancelled.`);
+    this.on(
+        'expireOldDrafts',
+        async () => {
+
+            const count =
+                await expireOldDrafts();
+
+            return `${count} draft request(s) expired.`;
         }
+    );
 
-        await UPDATE(targetQuery).set({ status: 'Cancelled' });
 
-        await createNotification(
-            req,
-            request.ID,
-            request.requesterName,
-            `Purchase Request ${request.purchaseRequestNo || request.ID} has been cancelled.`
-        );
+    // ============================================================
+    // AUTOMATIC DRAFT EXPIRY CHECK
+    // ============================================================
+    //
+    // Runs once when the service starts and then once every
+    // 24 hours.
+    // ============================================================
 
-        req.notify(`Purchase Request ${request.purchaseRequestNo || ''} cancelled.`);
-        return SELECT.one.from(targetQuery);
-    });
+    cds.on(
+        'served',
+        () => {
+
+            expireOldDrafts()
+                .catch(error => {
+                    console.error(
+                        'Error while expiring old drafts:',
+                        error
+                    );
+                });
+
+
+            setInterval(
+                () => {
+
+                    expireOldDrafts()
+                        .catch(error => {
+
+                            console.error(
+                                'Error while expiring old drafts:',
+                                error
+                            );
+                        });
+
+                },
+                24 * 60 * 60 * 1000
+            );
+        }
+    );
+
 });
